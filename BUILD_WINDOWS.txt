@@ -1,0 +1,8 @@
+FrankieXGM v1.0.0 Windows build
+
+1. Install Python 3.10+ on Windows.
+2. Open this folder.
+3. Run build_windows.bat.
+4. The standalone GUI executable will be in dist\FrankieXGM.exe.
+
+The finished EXE does not require Python to be installed on the target PC.
