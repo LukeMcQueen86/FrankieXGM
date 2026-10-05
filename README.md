@@ -188,11 +188,12 @@ machine.
 
 ### XGMTool / SGDK
 
-FrankieXGM is based on the work and XGMTool implementation by
+FrankieXGM is based on the work and XGMTool/XGM2Tool implementations by
 **Stephane Dallongeville**, part of SGDK.
 
 - [SGDK](https://github.com/Stephane-D/SGDK)
 - [XGMTool source](https://github.com/Stephane-D/SGDK/tree/master/tools/xgmtool)
+- [XGM2Tool source](https://github.com/Stephane-D/SGDK/tree/master/tools/xgm2tool)
 - [XGM specification](https://github.com/Stephane-D/SGDK/blob/master/bin/xgm.txt)
 - [XGM2 specification](https://github.com/Stephane-D/SGDK/blob/master/bin/xgm2.txt)
 
