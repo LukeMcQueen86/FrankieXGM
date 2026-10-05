@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""FrankieXGM 1.1.0 - Convert Genesis VGM/VGZ (YM2612 + SN76489 + SegaPCM) to XGM/XGM2.
+"""FrankieXGM 1.1.0 - Convert Genesis VGM/VGZ (YM2612 + SN76489 + SegaPCM) to XGM 1.01/XGM2
 
 - Converts YM2612 port 0/1 writes to XGM FM commands.
 - Converts SN76489 writes to XGM PSG commands.
 - Converts SegaPCM voices 0..3 to XGM PCM channels 0..3.
+- Converts YM2612 DAC streams (VGM commands 0x90-0x95) to an XGM PCM channel.
 - Suppresses all YM2612 channel 6 / DAC activity because XGM uses that DAC
   path for the four software-mixed PCM channels.
 - Preserves the VGM GD3 chunk verbatim when present.
@@ -40,6 +41,18 @@ class Voice:
     chip_rate: int = 4_000_000
     bank_shift: int = 12
     bank_mask: int = 0x70
+
+
+@dataclass
+class DacVoice(Voice):
+    """A YM2612 DAC-stream playback (VGM commands 0x90-0x95) treated as a PCM voice.
+
+    The stream's data block plays at `freq` Hz. start_addr is a unique id of the
+    data slice, loop_addr is 1 when the stream loops, end_addr is a marker that
+    keeps these keys apart from SegaPCM voices.
+    """
+    dac_data: bytes = b''
+    dac_loop: bool = False
 
 
 def u32(b, o): return struct.unpack_from('<I', b, o)[0]
@@ -156,15 +169,25 @@ def command_length(b, p):
     if 0x80 <= c <= 0x8F: return 1
     if c == 0x67: return 7 + u32(b,p+3)
     if c == 0x68: return 12
-    if 0x90 <= c <= 0x92: return 5
-    if 0x93 <= c <= 0x95: return 2
+    # DAC stream control (VGM 1.50+): only their lengths matter here, the
+    # YM2612 DAC / channel 6 is not converted.
+    if c == 0x64: return 4           # override length of 0x62/0x63 wait
+    if c in (0x90, 0x91): return 5   # setup stream control / set stream data
+    if c == 0x92: return 6           # set stream frequency
+    if c == 0x93: return 11          # start stream
+    if c == 0x94: return 2           # stop stream
+    if c == 0x95: return 5           # start stream (fast call)
     if 0xA0 <= c <= 0xAF: return 3
     if 0xB0 <= c <= 0xBF: return 3
     if 0xC0 <= c <= 0xCF: return 4
     if 0xD0 <= c <= 0xDF: return 4
     if c == 0xE0: return 5
     if 0xE1 <= c <= 0xFF: return 5
-    raise ValueError(f'unsupported/unknown VGM command 0x{c:02X} at 0x{p:X}')
+    ctx = b[max(0, p-16):p].hex(' ')
+    nxt = b[p:p+8].hex(' ')
+    raise ValueError(f'unsupported/unknown VGM command 0x{c:02X} at 0x{p:X} '
+                     f'(likely an earlier command with a wrong length); '
+                     f'bytes before: [{ctx}] at/after: [{nxt}]')
 
 def collect_segapcm_rom(vgm, end):
     blocks=[]; p=data_offset(vgm)
@@ -179,6 +202,62 @@ def collect_segapcm_rom(vgm, end):
             p=q+ln; continue
         p += command_length(vgm,p)
     return blocks
+
+def collect_dac_banks(vgm, end):
+    """Return {data_block_type: [block bytes, ...]} for uncompressed data blocks.
+
+    DAC streams address these by (bank type, block index in file order).
+    """
+    banks={}; p=data_offset(vgm); warned=False
+    while p < end:
+        c=vgm[p]
+        if c==0x66: break
+        if c==0x67:
+            if p+7>end or vgm[p+1]!=0x66: break
+            typ=vgm[p+2]; ln=u32(vgm,p+3); q=p+7
+            if q+ln>end: break
+            if typ < 0x40:
+                banks.setdefault(typ,[]).append(bytes(vgm[q:q+ln]))
+            elif typ < 0x7F and not warned:
+                print(f'Warning: compressed data block type 0x{typ:02X} is not supported and was skipped')
+                warned=True
+            p=q+ln; continue
+        p += command_length(vgm,p)
+    return banks
+
+def render_dac(data, src_rate, out_rate, duration, loop=False):
+    """Resample unsigned 8-bit DAC-stream data to signed 8-bit at out_rate."""
+    n=max(1,int(round(duration*out_rate)))
+    if not data or src_rate<=0: return bytes(n)
+    step=src_rate/float(out_rate)
+    need=int(math.ceil(n*step))+2
+    src=[b-128 for b in data]
+    if loop:
+        reps=need//len(src)+1
+        src=(src*reps)[:need]
+    L=len(src)
+    out=bytearray(n)
+    if step>1.0:
+        # box filter (average) when downsampling, like the XGM tools' resampler
+        pre=[0.0]*(L+1)
+        for i,x in enumerate(src): pre[i+1]=pre[i]+x
+        def F(x):
+            i=int(x)
+            if i>=L: return pre[L]
+            return pre[i]+src[i]*(x-i)
+        for i in range(n):
+            lo=i*step; hi=lo+step
+            if lo>=L: break
+            val=(F(hi)-F(lo))/step
+            out[i]=max(-128,min(127,int(round(val))))&0xFF
+    else:
+        for i in range(n):
+            pos=i*step; i0=int(pos)
+            if i0>=L: break
+            s0=src[i0]; s1=src[i0+1] if i0+1<L else 0
+            val=s0+(s1-s0)*(pos-i0)
+            out[i]=max(-128,min(127,int(round(val))))&0xFF
+    return bytes(out)
 
 def rom_read(blocks, addr):
     for blk in blocks:
@@ -195,6 +274,8 @@ def clone_voice(v):
 def render_segment(blocks, v, duration_seconds, output_rate=XGM_RATE, max_samples=8_000_000):
     # This is intentionally the v0.3.11 PCM renderer: keep the working sample
     # identification/timing behavior unchanged while adding FM/PSG support.
+    if isinstance(v, DacVoice):
+        return render_dac(v.dac_data, v.freq, output_rate, duration_seconds, v.dac_loop)
     n=max(1,min(max_samples,int(round(duration_seconds*output_rate))))
     out=bytearray(n)
     chip_tick_rate=v.chip_rate/128.0
@@ -256,6 +337,8 @@ def pcm_gain_data(data, mode=None, manual_db=0.0):
     return bytes(out), gain
 
 def native_duration(v):
+    if isinstance(v, DacVoice):
+        return float('inf') if v.dac_loop else len(v.dac_data)/max(1,v.freq)
     start=v.start_addr&0xFFFFFF
     end=((v.end_addr+1)&0xff)<<16
     distance=(end-start)&0xFFFFFF
@@ -489,6 +572,8 @@ def parse_timeline(vgm, data_end, chip_rate, bank_shift, bank_mask, rate):
         v.chip_rate=chip_rate; v.bank_shift=bank_shift; v.bank_mask=bank_mask
     pcm=[[] for _ in range(16)]
     chip_events=[]  # (sample_time, order, kind, args)
+    dac_banks=collect_dac_banks(vgm,data_end); dac_streams={}; dac_events=[]
+    dac_uid={}; dac_playing=False; dac_warned=set()
     samples=0; order=0; p=data_offset(vgm)
     frame=0; sample_cnt=0.0; limit=44100.0/rate; min_limit=limit*0.85
     loop_abs=(0x1C+u32(vgm,0x1C)) if u32(vgm,0x1C) else None
@@ -535,6 +620,44 @@ def parse_timeline(vgm, data_end, chip_rate, bank_shift, bank_mask, rate):
             else:
                 chip_events.append((samples,order,frame,'ym',(port,reg,val))); order+=1
             p+=3; continue
+        if 0x90<=c<=0x95:
+            # DAC streams. Only YM2612 (chip type 0x02) streams are converted.
+            ss=vgm[p+1]
+            if c==0x90:
+                dac_streams[ss]={'chip':vgm[p+2],'bank':0,'step':1,'base':0,'freq':0,'pos':0}
+            elif c==0x91 and ss in dac_streams:
+                st=dac_streams[ss]; st['bank']=vgm[p+2]; st['step']=vgm[p+3] or 1; st['base']=vgm[p+4]
+            elif c==0x92 and ss in dac_streams:
+                dac_streams[ss]['freq']=u32(vgm,p+2)
+            elif c in (0x93,0x95) and ss in dac_streams and dac_streams[ss]['chip']==0x02:
+                st=dac_streams[ss]; data=None; loop=False; rev=False
+                bank=dac_banks.get(st['bank'],[])
+                if c==0x95:
+                    bid=vgm[p+2]|vgm[p+3]<<8; loop=bool(vgm[p+4]&1)
+                    if bid<len(bank): data=bank[bid][st['base']::st['step']]; ident=('b',st['bank'],bid,st['base'],st['step'])
+                    elif ('b',bid) not in dac_warned:
+                        dac_warned.add(('b',bid)); print(f'Warning: DAC stream block {bid} not found; ignored')
+                else:
+                    off=struct.unpack_from('<i',vgm,p+2)[0]; mode=vgm[p+6]; ln=u32(vgm,p+7)
+                    full=b''.join(bank)[st['base']::st['step']]
+                    if off<0: off=st['pos']
+                    f=max(1,st['freq']); m=mode&0x0F
+                    if m==1: cnt=ln
+                    elif m==2: cnt=int(ln*f/1000.0)
+                    else: cnt=len(full)-off
+                    data=full[off:off+max(0,cnt)]; loop=bool(mode&0x80); rev=bool(mode&0x10)
+                    st['pos']=off+len(data)
+                    ident=('o',st['bank'],off,len(data),rev,st['base'],st['step'])
+                    if rev: data=data[::-1]
+                if data and st['freq']>0:
+                    uid=dac_uid.setdefault(ident,len(dac_uid)+1)
+                    dv=DacVoice(start_addr=uid,loop_addr=1 if loop else 0,end_addr=0xDAC,freq=st['freq'],
+                                lvol=127,rvol=127,ctrl=0x100,dac_data=bytes(data),dac_loop=loop)
+                    dac_events.append((samples,'start',dv)); dac_playing=True
+            elif c==0x94:
+                if dac_playing and (ss==0xFF or (ss in dac_streams and dac_streams[ss]['chip']==0x02)):
+                    dac_events.append((samples,'stop',None)); dac_playing=False
+            p+=command_length(vgm,p); continue
         if c==0xC0:
             addr=vgm[p+1]|vgm[p+2]<<8; val=vgm[p+3]
             # SegaPCM second chip is bit 7 of the high address byte.
@@ -558,6 +681,13 @@ def parse_timeline(vgm, data_end, chip_rate, bank_shift, bank_mask, rate):
                         elif was and not v.active: pcm[ch].append((samples,'stop',None))
             p+=4; continue
         p+=command_length(vgm,p)
+    if dac_events:
+        # Put the (single) YM2612 DAC stream on a PCM channel SegaPCM isn't using.
+        free=[ch for ch in range(4) if not pcm[ch]]
+        dch=free[0] if free else 3
+        pcm[dch]=sorted(pcm[dch]+dac_events,key=lambda e:e[0])
+        nstart=sum(1 for e in dac_events if e[1]=='start')
+        print(f'YM2612 DAC stream: {nstart} sample starts, {len(dac_uid)} distinct sample(s) -> XGM PCM channel {dch}')
     return pcm,chip_events,samples,loop_frame,frame
 
 def sgdk_frame_boundaries(vgm, data_end, rate):
