@@ -10,7 +10,7 @@ and SegaPCM assembled into one XGM soundtrack.
 
 **FrankieXGM v1.1.0 by [Luke McQueen](https://linktr.ee/lukemcqueen_)**
 
-**Based on XGMTool by Stephane Dallongeville, part of [SGDK](https://github.com/Stephane-D/SGDK).**
+**Based on XGMTool/XGM2Tool by Stephane Dallongeville, part of [SGDK](https://github.com/Stephane-D/SGDK).**
 
 > FrankieXGM is an independent project and is not an official SGDK project.
 
