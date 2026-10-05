@@ -9,19 +9,21 @@ from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
 import FrankieXGM as engine
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 AUTHOR_URL = "https://linktr.ee/lukemcqueen_"
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("FrankieXGM")
-        self.geometry("720x560")
+        self.geometry("720x720")
         self.minsize(650, 500)
 
         self.input_var = tk.StringVar()
         self.output_var = tk.StringVar()
         self.video_var = tk.StringVar(value="NTSC")
+        self.format_var = tk.StringVar(value="XGM 1.01")
+        self.xgm2_rate_var = tk.IntVar(value=engine.XGM2_FULL_RATE)
         self.pcm_mode = tk.StringVar(value="unchanged")
         self.gain_var = tk.StringVar(value="0")
         self.delay_keyoff_var = tk.BooleanVar(value=True)
@@ -36,24 +38,36 @@ class App(tk.Tk):
 
         title = ttk.Label(main, text="FrankieXGM", font=("TkDefaultFont", 20, "bold"))
         title.grid(row=0, column=0, columnspan=3, sticky="w")
-        ttk.Label(main, text="Mega Drive VGM/VGZ → XGM 1.01").grid(
+        ttk.Label(main, text="Mega Drive VGM/VGZ → XGM 1.01/XGM2").grid(
             row=1, column=0, columnspan=3, sticky="w", pady=(0, 12))
 
         ttk.Label(main, text="Input VGM/VGZ:").grid(row=2, column=0, sticky="w", **pad)
         ttk.Entry(main, textvariable=self.input_var).grid(row=2, column=1, sticky="ew", **pad)
         ttk.Button(main, text="Browse…", command=self.pick_input).grid(row=2, column=2, **pad)
 
-        ttk.Label(main, text="Output XGM:").grid(row=3, column=0, sticky="w", **pad)
+        ttk.Label(main, text="Output file:").grid(row=3, column=0, sticky="w", **pad)
         ttk.Entry(main, textvariable=self.output_var).grid(row=3, column=1, sticky="ew", **pad)
         ttk.Button(main, text="Browse…", command=self.pick_output).grid(row=3, column=2, **pad)
 
+        fmt = ttk.LabelFrame(main, text="Output format", padding=8)
+        fmt.grid(row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        ttk.Radiobutton(fmt, text="XGM 1.01 (4 PCM channels, 14 kHz)", value="XGM 1.01", variable=self.format_var, command=self.update_output_extension).pack(side="left", padx=8)
+        ttk.Radiobutton(fmt, text="XGM2 (3 PCM channels, 13.3/6.65 kHz)", value="XGM2", variable=self.format_var, command=self.update_output_extension).pack(side="left", padx=8)
+
+        self.xgm2_rate_frame = ttk.LabelFrame(main, text="XGM2 PCM sampling rate", padding=8)
+        self.xgm2_rate_frame.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        ttk.Radiobutton(self.xgm2_rate_frame, text="13.3 kHz (full rate)", value=engine.XGM2_FULL_RATE,
+                        variable=self.xgm2_rate_var).pack(side="left", padx=8)
+        ttk.Radiobutton(self.xgm2_rate_frame, text="6.65 kHz (half rate)", value=engine.XGM2_HALF_RATE,
+                        variable=self.xgm2_rate_var).pack(side="left", padx=8)
+
         video = ttk.LabelFrame(main, text="Video standard", padding=8)
-        video.grid(row=4, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        video.grid(row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
         ttk.Radiobutton(video, text="NTSC (60 Hz)", value="NTSC", variable=self.video_var).pack(side="left", padx=8)
         ttk.Radiobutton(video, text="PAL (50 Hz)", value="PAL", variable=self.video_var).pack(side="left", padx=8)
 
         pcm = ttk.LabelFrame(main, text="PCM volume", padding=8)
-        pcm.grid(row=5, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        pcm.grid(row=7, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
         ttk.Radiobutton(pcm, text="Unchanged", value="unchanged", variable=self.pcm_mode,
                         command=self.update_gain_state).grid(row=0, column=0, sticky="w", padx=8)
         ttk.Radiobutton(pcm, text="Automatic normalization", value="normalize", variable=self.pcm_mode,
@@ -67,32 +81,45 @@ class App(tk.Tk):
             row=1, column=0, columnspan=5, sticky="w", padx=8, pady=(6, 0))
 
         opts = ttk.LabelFrame(main, text="Timing", padding=8)
-        opts.grid(row=6, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
+        opts.grid(row=8, column=0, columnspan=3, sticky="ew", padx=10, pady=8)
         ttk.Checkbutton(opts, text="Delayed YM key-off (XGMTool-compatible behavior)",
                         variable=self.delay_keyoff_var).pack(anchor="w", padx=8)
 
         buttons = ttk.Frame(main)
-        buttons.grid(row=7, column=0, columnspan=3, pady=10)
+        buttons.grid(row=9, column=0, columnspan=3, pady=10)
         self.convert_btn = ttk.Button(buttons, text="Convert", command=self.start_conversion)
         self.convert_btn.pack(side="left", padx=6)
         ttk.Button(buttons, text="About", command=self.show_info).pack(side="left", padx=6)
 
-        ttk.Label(main, text="Status / conversion log:").grid(row=8, column=0, columnspan=3, sticky="w", padx=10)
+        ttk.Label(main, text="Status / conversion log:").grid(row=10, column=0, columnspan=3, sticky="w", padx=10)
         self.log = tk.Text(main, height=12, wrap="word", state="disabled")
-        self.log.grid(row=9, column=0, columnspan=3, sticky="nsew", padx=10, pady=(4, 10))
+        self.log.grid(row=10, column=0, columnspan=3, sticky="nsew", padx=10, pady=(4, 10))
         scroll = ttk.Scrollbar(main, orient="vertical", command=self.log.yview)
-        scroll.grid(row=9, column=3, sticky="ns", pady=(4, 10))
+        scroll.grid(row=10, column=3, sticky="ns", pady=(4, 10))
         self.log.configure(yscrollcommand=scroll.set)
+        self.update_xgm2_rate_visibility()
 
-        ttk.Label(main, textvariable=self.status_var).grid(row=10, column=0, columnspan=3, sticky="w", padx=10)
+        ttk.Label(main, textvariable=self.status_var).grid(row=11, column=0, columnspan=3, sticky="w", padx=10)
 
         main.columnconfigure(1, weight=1)
-        main.rowconfigure(9, weight=1)
+        main.rowconfigure(10, weight=1)
         self.update_gain_state()
 
     def update_gain_state(self):
         state = "normal" if self.pcm_mode.get() == "gain" else "disabled"
         self.gain_entry.configure(state=state)
+
+    def update_xgm2_rate_visibility(self):
+        if self.format_var.get() == "XGM2":
+            self.xgm2_rate_frame.grid()
+        else:
+            self.xgm2_rate_frame.grid_remove()
+
+    def update_output_extension(self):
+        self.update_xgm2_rate_visibility()
+        out = self.output_var.get().strip()
+        if out:
+            self.output_var.set(str(Path(out).with_suffix(".xgm")))
 
     def pick_input(self):
         p = filedialog.askopenfilename(
@@ -128,14 +155,14 @@ class App(tk.Tk):
         win.resizable(False, False)
         frame = ttk.Frame(win, padding=22)
         frame.pack()
-        ttk.Label(frame, text="FrankieXGM v1.0.0", font=("TkDefaultFont", 15, "bold")).pack(pady=(0, 8))
+        ttk.Label(frame, text=f"FrankieXGM v{APP_VERSION}", font=("TkDefaultFont", 15, "bold")).pack(pady=(0, 8))
         row = ttk.Frame(frame)
         row.pack()
         ttk.Label(row, text="by ").pack(side="left")
         link = tk.Label(row, text="Luke McQueen", fg="blue", cursor="hand2")
         link.pack(side="left")
         link.bind("<Button-1>", lambda e: webbrowser.open(AUTHOR_URL))
-        ttk.Label(frame, text="Based on XGMTool by Stephane Dallongeville").pack(pady=(6, 12))
+        ttk.Label(frame, text="Based on XGMTool/XGM2Tool by Stephane Dallongeville").pack(pady=(6, 12))
         ttk.Button(frame, text="Close", command=win.destroy).pack()
 
     def start_conversion(self):
@@ -175,16 +202,21 @@ class App(tk.Tk):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 data = engine.load_vgm(Path(inp))
-                result, info = engine.convert(
+                converter = engine.convert_xgm2 if self.format_var.get() == "XGM2" else engine.convert
+                args = (
                     data,
                     True if self.video_var.get() == "NTSC" else False,
                     self.pcm_mode.get() == "normalize",
                     gain,
                     self.delay_keyoff_var.get()
                 )
+                if self.format_var.get() == "XGM2":
+                    result, info = converter(*args, pcm_rate=self.xgm2_rate_var.get())
+                else:
+                    result, info = converter(*args)
                 Path(out).write_bytes(result)
                 print(f"Converted: {inp} -> {out}")
-                print(f"XGM: {info['frames']} frames ({info['seconds']:.2f}s), "
+                print(f"{info.get('format', 'XGM').upper()}: {info['frames']} frames ({info['seconds']:.2f}s), "
                       f"{info['samples']} PCM samples, {info['sample_bytes']} bytes PCM")
                 print(f"YM2612/PSG events: {info['fm_psg_events']}; "
                       f"SegaPCM starts: {info['pcm_starts']}; "

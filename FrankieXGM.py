@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FrankieXGM 1.0.0 - Convert Genesis VGM/VGZ (YM2612 + SN76489 + SegaPCM) to XGM 1.01.
+"""FrankieXGM 1.1.0 - Convert Genesis VGM/VGZ (YM2612 + SN76489 + SegaPCM) to XGM/XGM2.
 
 - Converts YM2612 port 0/1 writes to XGM FM commands.
 - Converts SN76489 writes to XGM PSG commands.
@@ -14,7 +14,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 XGM_RATE = 14000
+XGM2_FULL_RATE = 13300
+XGM2_HALF_RATE = 6650
 MAX_XGM_SAMPLES = 63
+MAX_XGM2_SAMPLES = 123
 PCM_AUTO_TARGET_RMS = 0.18       # ~= -14.9 dBFS; a useful Genesis-mix ballpark
 PCM_PEAK_CEILING = 0.7071        # -3 dBFS safety ceiling
 
@@ -189,14 +192,14 @@ def clone_voice(v):
     return Voice(bytearray(v.regs),v.active,v.start_addr,v.loop_addr,v.end_addr,v.freq,
                  v.lvol,v.rvol,v.ctrl,v.chip_rate,v.bank_shift,v.bank_mask)
 
-def render_segment(blocks, v, duration_seconds, max_samples=8_000_000):
+def render_segment(blocks, v, duration_seconds, output_rate=XGM_RATE, max_samples=8_000_000):
     # This is intentionally the v0.3.11 PCM renderer: keep the working sample
     # identification/timing behavior unchanged while adding FM/PSG support.
-    n=max(1,min(max_samples,int(round(duration_seconds*XGM_RATE))))
+    n=max(1,min(max_samples,int(round(duration_seconds*output_rate))))
     out=bytearray(n)
     chip_tick_rate=v.chip_rate/128.0
     source_rate=chip_tick_rate*max(1,v.freq)/256.0
-    source_step=source_rate/XGM_RATE
+    source_step=source_rate/output_rate
     pos=float(v.start_addr & 0xFFFFFF)
     loop=float((v.loop_addr & 0xFFFF)<<8)
     scale=((v.lvol&0x7f)+(v.rvol&0x7f))/254.0
@@ -634,6 +637,382 @@ def loop_frame_for(vgm, data_end, rate):
             p += command_length(vgm, p)
     return sgdk_frame_for_sample(ts, rate)
 
+def _xgm2_pcm_rate(rate):
+    """Return the selected XGM2 PCM playback rate."""
+    if rate not in (XGM2_FULL_RATE, XGM2_HALF_RATE):
+        raise ValueError(f'unsupported XGM2 PCM rate: {rate}')
+    return rate
+
+
+def _xgm2_pcm_command(channel, sample_id, half_rate=False, priority=0):
+    # XGM2: $1x id; bits 0-1 channel, bit 2 half speed, bit 3 priority.
+    op = 0x10 | (channel & 3)
+    if half_rate:
+        op |= 0x04
+    if priority:
+        op |= 0x08
+    return bytes((op, sample_id & 0xFF))
+
+
+def _xgm2_fm_key(value):
+    # XGM2 has compact ALL-ON/ALL-OFF key commands and an advanced form for
+    # partial operator key writes.
+    key_write = value & 0xF0
+    ch = value & 0x07
+    if key_write in (0x00, 0xF0):
+        return bytes((0x40 | (0x08 if key_write else 0) | ch,))
+    return bytes((0xF8, value & 0xFF))
+
+
+def _xgm2_fm_write(port, writes):
+    # XGM2 $Ex supports 1..8 arbitrary YM register writes per command.
+    writes = writes[:8]
+    return bytes((0xE0 | ((port & 1) << 3) | (len(writes)-1),)) + bytes(
+        b for pair in writes for b in pair
+    )
+
+
+def _xgm2_psg_commands(events):
+    """Convert cleaned PSG state writes to compact XGM2 PSG commands."""
+    out=[]
+    i=0
+    while i < len(events):
+        val=events[i][2]
+        if val & 0x80:
+            channel=(val >> 5) & 3
+            typ=(val >> 4) & 1
+            low=val & 0x0F
+            if typ == 1:
+                # $8x-$Bx volume/envelope set.
+                out.append(bytes((0x80 | (channel << 4) | low,)))
+                i += 1
+                continue
+            # Tone/noise low nibble. If followed by a high portion, combine
+            # them into the XGM2 $2x tone command; otherwise use $1x low update.
+            if i + 1 < len(events) and not (events[i+1][2] & 0x80):
+                high = events[i+1][2] & 0x3F
+                b0 = 0x20 | (channel << 2) | ((high >> 4) & 0x03)
+                b1 = ((high & 0x0F) << 4) | low
+                out.append(bytes((b0,b1)))
+                i += 2
+            else:
+                out.append(bytes((0x10, 0x80 | (channel << 5) | low)))
+                i += 1
+        else:
+            # Defensive fallback: XGM2 high tone data should normally be paired
+            # with its latch byte by _psg_delta().
+            out.append(bytes((0x10, val & 0xFF)))
+            i += 1
+    return out
+
+
+def _xgm2_fm_group(items):
+    """Group a frame's FM items into XGM2 commands.
+
+    items are (port, reg, val) tuples (YM register writes) or ready-made
+    command bytes (key / LFO / CH3 mode). Dedicated commands act as barriers
+    so key/register ordering is kept; between barriers, port 0 and port 1
+    writes are collected separately (they address independent registers), so
+    interleaved ports no longer split into many small commands. Max 8 writes
+    per command.
+    """
+    out = []; pend = ([], [])
+    def flush():
+        for port in (0, 1):
+            w = pend[port]
+            for i in range(0, len(w), 8):
+                out.append(_xgm2_fm_write(port, w[i:i+8]))
+            w.clear()
+    for it in items:
+        if isinstance(it, tuple):
+            pend[it[0] & 1].append((it[1], it[2]))
+        else:
+            flush(); out.append(it)
+    flush()
+    return out
+
+
+def _xgm2_fm_misc(port, reg, val):
+    """Translate YM global registers to dedicated XGM2 commands.
+
+    Returns bytes for a dedicated command, b'' when the write must be dropped
+    (timer registers), or None when it should be sent as a normal FM write.
+    """
+    if port != 0:
+        return None
+    if reg == 0x22:                      # LFO: FM_LFO ($F9 xx)
+        return bytes((0xF9, val & 0xFF))
+    if reg == 0x27:                      # CH3 mode: FM_CH3_ON ($FA) / OFF ($FB)
+        return bytes((0xFA if (val & 0x40) else 0xFB,))
+    if reg in (0x24, 0x25, 0x26):        # timers are not used by XGM2
+        return b''
+    return None
+
+
+def _xgm2_waits(n, is_fm):
+    """Encode an n-frame wait using short/long XGM2 wait commands.
+
+    FM: short = (n-1)&0xF for 1-15 frames, long = $0F nn with n = nn+16
+        (up to 271 frames).
+    PSG: short $00-$0D = 1-14 frames, long = $0E nn with n = nn+15 (up to 270).
+    """
+    smax = 15 if is_fm else 14
+    lmax = 271 if is_fm else 270
+    lop = 0x0F if is_fm else 0x0E
+    bias = smax + 1
+    out = bytearray()
+    while n > lmax:
+        out += bytes((lop, lmax - bias)); n -= lmax
+    if n > smax:
+        out += bytes((lop, n - bias))
+    elif n > 0:
+        out.append(n - 1)
+    return bytes(out)
+
+
+def _xgm2_active_pcm_channel_map(pcm_timeline):
+    """Assign source SegaPCM channels to the three XGM2 PCM slots.
+
+    The source channel mapping is retained where possible. If channels are
+    inactive, their slots may be reused by another source channel. Four
+    simultaneous PCM voices are rejected rather than silently losing audio.
+    """
+    events=[]
+    for src, evs in enumerate(pcm_timeline[:4]):
+        for t, kind, v in evs:
+            events.append((t, 0 if kind == 'stop' else 1, src, kind, v))
+    events.sort(key=lambda x:(x[0], x[1]))
+    src_to_slot={}; slot_to_src={}; mapped=[]
+    for t, order, src, kind, v in events:
+        if kind == 'start':
+            slot=src_to_slot.get(src)
+            if slot is None:
+                free=[x for x in range(3) if x not in slot_to_src]
+                if not free:
+                    raise ValueError('XGM2 supports only 3 simultaneous PCM channels; this track requires 4.')
+                slot=free[0]
+                src_to_slot[src]=slot; slot_to_src[slot]=src
+            mapped.append((src,t,kind,v,slot))
+        else:
+            slot=src_to_slot.get(src)
+            if slot is not None:
+                mapped.append((src,t,kind,v,slot))
+                src_to_slot.pop(src,None); slot_to_src.pop(slot,None)
+    return mapped
+
+
+def convert_xgm2(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off=True, pcm_rate=XGM2_FULL_RATE):
+    """Convert VGM to the classic SGDK XGM2 file format (unpacked).
+
+    This backend follows the XGM2 file layout and command encodings from the
+    supplied SGDK xgm2tool source. It intentionally uses general YM register
+    writes rather than all of xgm2tool's optional FM micro-optimizations; the
+    resulting file remains standard XGM2 and prioritizes faithful playback.
+    """
+    pcm_rate = _xgm2_pcm_rate(pcm_rate)
+    ver, has_segapcm = validate_vgm(vgm)
+    print(f'VGM version: {version_text(ver)}')
+    print('SegaPCM support: available' if ver >= 0x151 else 'SegaPCM support: unavailable for this VGM version (YM2612/PSG only)')
+    rate=60 if ntsc is not False else 50
+    chip=u32(vgm,0x38)&0x7fffffff or 4_000_000
+    spcm_if=u32(vgm,0x3c) if len(vgm)>=0x40 else 0
+    bank_shift=(spcm_if&0x0f) if spcm_if else 12
+    bank_mask=(0x70|((spcm_if>>16)&0xfc)) if spcm_if else 0x70
+    eof=eof_offset(vgm); gd3=gd3_chunk(vgm,eof); data_end=eof
+    if gd3:
+        pos=vgm.find(gd3, data_offset(vgm), eof); data_end=pos if pos>=0 else eof
+    blocks=collect_segapcm_rom(vgm,data_end)
+    pcm_timeline, chip_events, total_samples, loop_frame, converted_frames=parse_timeline(vgm,data_end,chip,bank_shift,bank_mask,rate)
+    if not any(pcm_timeline[ch] for ch in range(4)) and not chip_events:
+        raise ValueError('no YM2612/PSG/SegaPCM playback data found')
+    cleaned_chip=clean_chip_events(chip_events,rate,loop_frame,[],delay_key_off)
+
+    # Render/deduplicate PCM variants at the user-selected XGM2 PCM rate.
+    rendered={}; sample_ids={}; xgm_samples=[]; sample_half={}; starts=[]; content_ids={}
+    state_duration={}
+    for ch in range(4):
+        evs=pcm_timeline[ch]
+        for i,(t,kind,v) in enumerate(evs):
+            if kind!='start': continue
+            t2=evs[i+1][0] if i+1<len(evs) else total_samples
+            dur=max(0,(t2-t)/44100.0); dur=min(dur,native_duration(v))
+            out_rate=pcm_rate
+            key=(v.start_addr,v.loop_addr,v.end_addr,v.freq,v.lvol&127,v.rvol&127,v.ctrl&0x72,out_rate)
+            state_duration[key]=max(state_duration.get(key,0),dur)
+            starts.append((ch,t,v,key,out_rate))
+    for ch,t,v,key,out_rate in starts:
+        dur=state_duration[key]
+        if dur<=1/out_rate: continue
+        if key not in rendered:
+            data=render_segment(blocks,v,dur,output_rate=out_rate)
+            balance_mode='auto' if pcm_normalize else ('manual' if pcm_gain_db is not None else None)
+            data,_=pcm_gain_data(data,balance_mode,pcm_gain_db or 0.0)
+            data=_pcm_pad_fade(data)
+            # Identical rendered data shares one sample (rate flag is per play command).
+            sid=content_ids.get((data,out_rate))
+            if sid is None:
+                xgm_samples.append(data); sid=len(xgm_samples); content_ids[(data,out_rate)]=sid
+                if len(xgm_samples)>MAX_XGM2_SAMPLES:
+                    raise ValueError('more than 123 XGM2 PCM samples required')
+            rendered[key]=data; sample_ids[key]=sid; sample_half[key]=(out_rate==XGM2_HALF_RATE)
+
+    mapped=_xgm2_active_pcm_channel_map(pcm_timeline)
+    fm_by_frame={}; psg_by_frame={}; pcm_by_frame={}
+    for frame, evs in cleaned_chip.items():
+        for ts,order,kind,args in evs:
+            if kind=='ymkey':
+                fm_by_frame.setdefault(frame,[]).append((ts,order,_xgm2_fm_key(args[1])))
+            elif kind=='ym':
+                port,reg,val=args
+                fm_by_frame.setdefault(frame,[]).append((ts,order,(port,reg,val)))
+            elif kind=='psg':
+                psg_by_frame.setdefault(frame,[]).append((ts,order,args))
+    for src,t,kind,v,slot in mapped:
+        frame=sgdk_frame_for_sample(t,rate)
+        if kind=='start':
+            # Locate the rendered key matching this start.
+            out_rate=pcm_rate
+            key=(v.start_addr,v.loop_addr,v.end_addr,v.freq,v.lvol&127,v.rvol&127,v.ctrl&0x72,out_rate)
+            sid=sample_ids.get(key)
+            if sid is not None:
+                pcm_by_frame.setdefault(frame,[]).append((t,0,_xgm2_pcm_command(slot,sid,sample_half[key],0)))
+        else:
+            pcm_by_frame.setdefault(frame,[]).append((t,0,_xgm2_pcm_command(slot,0,False,0)))
+
+    # Build the two XGM2 music streams. FM/PCM share the FM stream; PSG is
+    # independent. Both receive the same frame waits so their timelines remain
+    # synchronized. The final FF command is also the loop command when present.
+    fm=bytearray(); psg=bytearray(); fm_loop=None; psg_loop=None; fm_wait=0; psg_wait=0
+    for frame in range(converted_frames):
+        if loop_frame is not None and frame==loop_frame:
+            # Flush pending waits so the loop offset lands on this frame's commands.
+            fm.extend(_xgm2_waits(fm_wait,True)); fm_wait=0
+            psg.extend(_xgm2_waits(psg_wait,False)); psg_wait=0
+            fm_loop=len(fm); psg_loop=len(psg)
+        fcmds=bytearray(); pcmds=bytearray()
+        if frame==0:
+            # DAC enable via the dedicated FM_DAC_ON command ($FC). The XGM2
+            # driver owns channel 6 / panning, so no raw 2B/B6 writes.
+            fcmds.append(0xFC)
+        fevs=fm_by_frame.get(frame,[])
+        # Group arbitrary YM writes by port, preserving timestamp/order.
+        items=[]
+        for item in sorted(fevs,key=lambda x:(x[0],x[1])):
+            if isinstance(item[2],tuple):
+                port,reg,val=item[2]
+                misc=_xgm2_fm_misc(port,reg,val)
+                if misc is None: items.append((port,reg,val))
+                elif misc: items.append(misc)   # b'' = dropped (timers)
+            else:
+                items.append(item[2])
+        ym_groups=_xgm2_fm_group(items)
+        # PCM commands follow the chip writes in this frame.
+        for cmd in ym_groups: fcmds.extend(cmd)
+        for _,_,cmd in sorted(pcm_by_frame.get(frame,[]),key=lambda x:(x[0],x[1])): fcmds.extend(cmd)
+        if fcmds:
+            fm.extend(_xgm2_waits(fm_wait,True)); fm_wait=0; fm.extend(fcmds)
+        fm_wait+=1
+
+        pevs=_xgm2_psg_commands(sorted(psg_by_frame.get(frame,[]),key=lambda x:(x[0],x[1])))
+        for cmd in pevs: pcmds.extend(cmd)
+        if pcmds:
+            psg.extend(_xgm2_waits(psg_wait,False)); psg_wait=0; psg.extend(pcmds)
+        psg_wait+=1
+    fm.extend(_xgm2_waits(fm_wait,True)); psg.extend(_xgm2_waits(psg_wait,False))
+
+    def append_end_or_loop(stream, loop_off, end_opcode):
+        if loop_off is None:
+            return stream + bytes((end_opcode,0xFF,0xFF,0xFF))
+        return stream + bytes((end_opcode,loop_off&0xFF,(loop_off>>8)&0xFF,(loop_off>>16)&0xFF))
+    fm=append_end_or_loop(fm,fm_loop,0xFF)
+    psg=append_end_or_loop(psg,psg_loop,0x0F)
+
+    pcm_blob=bytearray()
+    table=[]
+    for data in xgm_samples:   # samples are already padded to 256 bytes
+        table.append(len(pcm_blob)//256)
+        pcm_blob.extend(data)  # already signed 8-bit (silence = 0x00), as XGM2 expects
+    hdr=bytearray(b'XGM2')
+    hdr += bytes((0x10, (1 if rate==50 else 0) | (4 if gd3 else 0)))
+    def aligned(block): return (len(block)+255)//256*256
+    fm_padded=fm + bytes(aligned(fm)-len(fm)); psg_padded=psg + bytes(aligned(psg)-len(psg))
+    hdr += struct.pack('<HHH',len(pcm_blob)//256,len(fm_padded)//256,len(psg_padded)//256)
+    # 124 entries: start of each sample, then the end of the last sample
+    # (needed by the driver to compute its length), then 0xFFFF fill.
+    for i in range(124):
+        if i<len(table): addr=table[i]
+        elif i==len(table): addr=len(pcm_blob)//256
+        else: addr=0xFFFF
+        hdr += struct.pack('<H',addr)
+    out=bytes(hdr)+bytes(pcm_blob)+bytes(fm_padded)+bytes(psg_padded)+gd3
+    return out, {'frames':converted_frames,'seconds':converted_frames/rate,'samples':len(xgm_samples),
+                 'sample_bytes':len(pcm_blob),'rate':rate,'fm_psg_events':sum(len(v) for v in cleaned_chip.values()),
+                 'pcm_starts':sum(1 for _,_,k,_,_ in mapped if k=='start'),'gd3':bool(gd3),'format':'XGM2'}
+
+
+def _xgm1_pack(base, items, pair):
+    """Pack items into XGM 1 grouped commands (max 16 entries per command).
+
+    base = 0x10 PSG, 0x20/0x30 YM port 0/1 (reg,val pairs), 0x40 YM key.
+    The command byte is base | (count-1), followed by the entries.
+    """
+    out = bytearray()
+    for i in range(0, len(items), 16):
+        chunk = items[i:i+16]
+        out.append(base | (len(chunk) - 1))
+        for it in chunk:
+            if pair: out.append(it[0]); out.append(it[1])
+            else: out.append(it)
+    return bytes(out)
+
+
+def _xgm1_frame_bytes(evs):
+    """Encode one frame's events like xgmtool's XGM_extractMusic().
+
+    Consecutive writes of the same kind are merged into one grouped command.
+    Per frame the order is: YM port 0, YM port 1, YM keys, PSG, PCM. A YM
+    register write arriving after a key event flushes the pending YM groups,
+    so key/register ordering is preserved. Different chips are independent,
+    so moving PSG/PCM after the YM writes does not change the sound.
+    """
+    out = bytearray()
+    p0 = []; p1 = []; keys = []; psg = []; pcm = bytearray()
+    def flush_ym():
+        if p0: out.extend(_xgm1_pack(0x20, p0, True))
+        if p1: out.extend(_xgm1_pack(0x30, p1, True))
+        if keys: out.extend(_xgm1_pack(0x40, keys, False))
+        p0.clear(); p1.clear(); keys.clear()
+    for op, val in evs:
+        if op == 0x10: psg.append(val)
+        elif op == 0x40: keys.append(val)
+        elif op == 0x20 or op == 0x30:
+            if keys: flush_ym()
+            (p0 if op == 0x20 else p1).append(val)
+        else: pcm.append(op); pcm.append(val)
+    flush_ym()
+    if psg: out.extend(_xgm1_pack(0x10, psg, False))
+    out.extend(pcm)
+    return bytes(out)
+
+
+def _pcm_pad_fade(data):
+    """Pad a sample to a multiple of 256 bytes with a linear fade to silence.
+
+    xgmtool's resample() ramps the last value down to 0 over the padding
+    instead of stepping to 0, which avoids a click at the end of the sample.
+    """
+    pad = (-len(data)) % 256
+    if not pad:
+        return bytes(data)
+    s = float(data[-1] - 256 if data[-1] > 127 else data[-1])
+    red = s / pad
+    out = bytearray(data)
+    for _ in range(pad):
+        s -= red
+        out.append(int(math.copysign(math.floor(abs(s) + 0.5), s)) & 0xFF)
+    return bytes(out)
+
+
 def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off=True):
     ver, has_segapcm = validate_vgm(vgm)
     print(f"VGM version: {version_text(ver)}")
@@ -667,7 +1046,7 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
     print(f"Number of command after commands clean: {clean_count}")
     print(f"Number of command after PCM command remove: {clean_count}")
 
-    rendered={}; sample_ids={}; xgm_samples=[]; frame_cmds={}; start_count=0
+    rendered={}; sample_ids={}; xgm_samples=[]; content_ids={}; frame_cmds={}; start_count=0
     state_duration={}; starts=[]
     for ch in range(4):
         evs=pcm_timeline[ch]
@@ -684,8 +1063,13 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
             data=render_segment(blocks,v,dur)
             balance_mode = 'auto' if pcm_normalize else ('manual' if pcm_gain_db is not None else None)
             data, applied_gain = pcm_gain_data(data, balance_mode, pcm_gain_db or 0.0)
-            rendered[key]=data; sample_ids[key]=len(xgm_samples)+1; xgm_samples.append(data)
-            if len(xgm_samples)>MAX_XGM_SAMPLES: raise ValueError('more than 63 XGM PCM samples required')
+            data=_pcm_pad_fade(data)
+            # Identical rendered data (different VGM voice state, same sound) shares one sample.
+            sid=content_ids.get(data)
+            if sid is None:
+                xgm_samples.append(data); sid=len(xgm_samples); content_ids[data]=sid
+                if len(xgm_samples)>MAX_XGM_SAMPLES: raise ValueError('more than 63 XGM PCM samples required')
+            rendered[key]=data; sample_ids[key]=sid
         frame_cmds.setdefault(frame,[]).append((t,0x50|ch,sample_ids[key]))
     for ch in range(4):
         for t,kind,_ in pcm_timeline[ch]:
@@ -723,7 +1107,7 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
         resolved[frame] = [e for _, e in merged]
     frame_cmds = resolved
 
-    # XGM command stream. PCM command priority is 0.
+    # XGM command stream. PCM command priority is 0, matching the working v0.3.11.
     # Follow SGDK XGMTool's frame conversion and, importantly, keep the final
     # frame wait before the loop command. The loop command is zero-time, so it
     # must come AFTER the last 0x00 belonging to the loop. Otherwise the loop
@@ -746,12 +1130,12 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
     for frame in range(converted_frames):
         frame_offsets[frame]=len(music)
         evs=frame_cmds.get(frame,[])
-        evs=sorted(enumerate(evs), key=lambda x:(x[1][0],x[0]))
-        for _,e in evs:
-            _,op,val=e
-            if op==0x10: music += bytes([op,val])
-            elif op in (0x20,0x30): music += bytes([op,val[0],val[1]])
-            else: music += bytes([op,val])
+        evs=[(e[1],e[2]) for _,e in sorted(enumerate(evs), key=lambda x:(x[1][0],x[0]))]
+        if frame==0:
+            # DAC enable (port 0, reg 2B) + ch6 pan L+R (port 1, reg B6),
+            # merged into frame 0's grouped YM commands.
+            evs=[(0x20,(0x2B,0x80)),(0x30,(0xB6,0xC0))]+evs
+        music += _xgm1_frame_bytes(evs)
         music.append(0)
 
     if has_loop:
@@ -767,11 +1151,11 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
     sample_blob=bytearray(); table=[]
     for data in xgm_samples:
         while len(sample_blob)%256: sample_blob.append(0)
-        a=len(sample_blob)//256; padded=data+b'\x00'*((-len(data))%256)
-        sample_blob.extend(padded); table.append((a,len(padded)//256))
+        a=len(sample_blob)//256   # data is already padded to 256 bytes
+        sample_blob.extend(data); table.append((a,len(data)//256))
     hdr=bytearray(b'XGM ')
     for i in range(63):
-        hdr += struct.pack('<HH',*(table[i] if i<len(table) else (0xffff,1)))
+        hdr += struct.pack('<HH',*(table[i] if i<len(table) else (0xffff,0)))  # silent-sample mark, as xgmtool
     flags=0 if rate==60 else 1
     if gd3: flags|=2
     hdr += struct.pack('<HBB',len(sample_blob)//256,1,flags)
@@ -779,21 +1163,26 @@ def convert(vgm, ntsc=None, pcm_normalize=False, pcm_gain_db=None, delay_key_off
     frame_count = converted_frames
     return out, {'frames':frame_count,'seconds':frame_count/rate,'samples':len(xgm_samples),
                  'sample_bytes':len(sample_blob),'rate':rate,'fm_psg_events':sum(len(v) for v in cleaned_chip.values()),
-                 'pcm_starts':start_count,'gd3':bool(gd3)}
+                 'pcm_starts':start_count,'gd3':bool(gd3),'format':'XGM'}
 
 def main():
-    ap=argparse.ArgumentParser(description='FrankieXGM - Convert Genesis YM2612+SN76489+SegaPCM VGM/VGZ to XGM 1.01')
+    ap=argparse.ArgumentParser(description='FrankieXGM - Convert Genesis YM2612+SN76489+SegaPCM VGM/VGZ to classic XGM 1.01')
     ap.add_argument('input'); ap.add_argument('output'); ap.add_argument('--ntsc',action='store_true'); ap.add_argument('--pal',action='store_true')
+    ap.add_argument('--format', choices=('xgm','xgm2'), default='xgm', help='output format (default: xgm)')
+    ap.add_argument('--xgm2-rate', choices=('13300','6650'), default='13300',
+                    help='XGM2 PCM sampling rate in Hz: 13300 (13.3 kHz) or 6650 (6.65 kHz); default: 13300')
     ap.add_argument('--dd', action='store_true', help='disable delayed YM key-off (XGMTool-compatible default is enabled)')
     pcm_group=ap.add_mutually_exclusive_group()
     pcm_group.add_argument('--pcm-normalize', action='store_true', help='automatically balance PCM loudness using RMS targeting with a -3 dBFS peak ceiling')
     pcm_group.add_argument('--pcm-gain', type=float, metavar='DB', help='apply a fixed PCM gain in dB, with a -3 dBFS peak ceiling')
     a=ap.parse_args()
     if a.ntsc and a.pal: ap.error('--ntsc and --pal are mutually exclusive')
-    out,info=convert(load_vgm(Path(a.input)), True if a.ntsc else False if a.pal else None, a.pcm_normalize, a.pcm_gain, not a.dd)
+    converter = convert_xgm2 if a.format == 'xgm2' else convert
+    kwargs = dict(pcm_rate=int(a.xgm2_rate)) if a.format == 'xgm2' else {}
+    out,info=converter(load_vgm(Path(a.input)), True if a.ntsc else False if a.pal else None, a.pcm_normalize, a.pcm_gain, not a.dd, **kwargs)
     Path(a.output).write_bytes(out)
     print(f"Converted: {a.input} -> {a.output}")
-    print(f"XGM: {info['frames']} frames ({info['seconds']:.2f}s), {info['samples']} PCM samples, {info['sample_bytes']} bytes PCM")
+    print(f"{info.get('format', 'XGM').upper()}: {info['frames']} frames ({info['seconds']:.2f}s), {info['samples']} PCM samples, {info['sample_bytes']} bytes PCM")
     print(f"YM2612/PSG events: {info['fm_psg_events']}; SegaPCM starts: {info['pcm_starts']}; GD3: {'yes' if info['gd3'] else 'no'}")
 
 if __name__=='__main__': main()
