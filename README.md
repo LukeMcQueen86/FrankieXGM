@@ -80,20 +80,18 @@ YM2612/PSG loudness.
 ### Per-sample volume
 
 FrankieXGM does **not** preserve or generate separate XGM PCM volume settings
-for individual samples. Classic XGM 1.01 does not provide a per-sample volume
-field in its PCM play command; the command specifies the PCM priority, channel,
-and sample ID. To reproduce different static volume levels with the standard
-XGM driver, FrankieXGM would have to generate separate PCM data variants of
+for individual samples. Neither XGM 1.01 or XGM2 provide a per-sample volume
+field in their PCM play command; the command specifies the PCM priority, channel,
+and sample ID. To reproduce different static volume levels with the
+XGM driver, FrankieXGM has to generate separate PCM data variants of
 the same sample (for example, one copy at 100%, another at 50%, and another at
 25%). This can unnecessarily increase the converted XGM's PCM data size and
 consume additional sample IDs, especially when combined with sample variants
 already required for different playback rates.
 
-For this reason, per-sample volume conversion is intentionally not implemented.
-If different samples need different static levels, set their volume in the
-source music before exporting the track to VGM, then convert that VGM with
-FrankieXGM. Dynamic volume changes while a sample is already playing are also
-not reproduced.
+If different samples need different static levels, it's preferrable to
+set their volume in the source project before exporting the track to VGM,
+then convert that VGM with FrankieXGM.
 
 ## XGM 1.01 and XGM2 output
 
