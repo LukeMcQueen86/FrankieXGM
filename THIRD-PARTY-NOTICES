@@ -1,12 +1,12 @@
 FrankieXGM — Third-Party Notices
 ================================
 
-SGDK / XGMTool
---------------
+SGDK / XGMTool / XGM2Tool
+------------------------
 
-FrankieXGM is based on the XGMTool implementation and XGM file-format work
-developed by Stephane Dallongeville as part of SGDK (Sega Genesis Development
-Kit).
+FrankieXGM is based on the XGMTool and XGM2Tool implementations and the
+XGM/XGM2 file-format work developed by Stephane Dallongeville as part of SGDK
+(Sega Genesis Development Kit).
 
 Project:
 https://github.com/Stephane-D/SGDK
@@ -14,8 +14,14 @@ https://github.com/Stephane-D/SGDK
 XGMTool source:
 https://github.com/Stephane-D/SGDK/tree/master/tools/xgmtool
 
+XGM2Tool source:
+https://github.com/Stephane-D/SGDK/tree/master/tools/xgm2tool
+
 XGM file format specification:
 https://github.com/Stephane-D/SGDK/blob/master/bin/xgm.txt
+
+XGM2 file format specification:
+https://github.com/Stephane-D/SGDK/blob/master/bin/xgm2.txt
 
 SGDK and its custom tools are distributed under the MIT License.
 
